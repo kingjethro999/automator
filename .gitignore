@@ -11,15 +11,10 @@ act/
 .act-sandbox-agent.*
 .venv/
 .venv
-.vscode/
-.env
 .op.env
-.env.local
 .env.development.local
 .env.test.local
 .env.production.local
-.env.development
-.env.test
 .hermes-docker/
 .notebooklm-home/
 .notebooklm-cli-venv/
@@ -304,3 +299,4 @@ native/fts5_cjk/*.so
 
 # Disposable profile created by scripts/probe_active_session_exclusivity.py
 .probe-home/
+config.bat
