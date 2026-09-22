@@ -1,0 +1,33 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "bot/js-autofix",
+    "ethie-pm-clean",
+    "fix/incomplete-tool-call-recovery",
+    "hermes/hermes-47c66096",
+    "local-runtime-fixes",
+    "main",
+    "paperclip-port/copy-action-feedback",
+    "sid/ns-923-hermes-platform-app-based-mcp"
+  ],
+  "parent": {
+    "bot/js-autofix": "main",
+    "ethie-pm-clean": "main",
+    "fix/incomplete-tool-call-recovery": "main",
+    "hermes/hermes-47c66096": "main",
+    "local-runtime-fixes": "main",
+    "main": null,
+    "paperclip-port/copy-action-feedback": "main",
+    "sid/ns-923-hermes-platform-app-based-mcp": "main"
+  },
+  "order": [
+    "main",
+    "bot/js-autofix",
+    "ethie-pm-clean",
+    "fix/incomplete-tool-call-recovery",
+    "hermes/hermes-47c66096",
+    "local-runtime-fixes",
+    "paperclip-port/copy-action-feedback",
+    "sid/ns-923-hermes-platform-app-based-mcp"
+  ]
+}
