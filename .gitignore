@@ -319,3 +319,6 @@ native/fts5_cjk/*.so
 /pm/.lock.json.lock
 
 apps/desktop/.dist-build*
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
