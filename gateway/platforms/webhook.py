@@ -51,7 +51,7 @@ _UNPARSEABLE = object()
 
 _BUILTIN_DELIVER_PLATFORMS = {
     "telegram", "discord", "slack", "signal", "sms", "whatsapp", "matrix", "mattermost",
-    "homeassistant", "email", "dingtalk", "feishu", "wecom", "wecom_callback", "weixin",
+    "email", "dingtalk", "feishu", "wecom", "wecom_callback", "weixin",
     "bluebubbles", "qqbot", "yuanbao"}
 
 # ``None`` → aiohttp binds BOTH address families. "0.0.0.0" is IPv4-only (unreachable on IPv6-only
@@ -109,6 +109,16 @@ def _hex_hmac(secret: str, data: bytes) -> str:
     return hmac.new(secret.encode(), data, hashlib.sha256).hexdigest()
 
 
+def _is_usable_secret(secret: object) -> bool:
+    """True when ``secret`` is a string with at least one non-space character.
+
+    A whitespace-only value is what an unset key looks like in config. It is
+    falsy to a person and truthy to ``if not secret``, so a bare falsy check
+    lets it through. Non-strings are rejected for the same reason.
+    """
+    return isinstance(secret, str) and bool(secret.strip())
+
+
 def _timestamp_fresh(raw: str, stale_msg: str, *args) -> bool:
     """True when integer timestamp header *raw* is within the replay window; unparseable → False,
     stale → warn ``stale_msg % args`` and False."""
@@ -164,6 +174,10 @@ def _validate_svix_signature(body: bytes, secret: str, msg_id: str, timestamp: s
         except (binascii.Error, ValueError):
             logger.debug("[webhook] Invalid whsec_ Svix signing secret")
             return False
+        # "whsec_" alone decodes to b"": a public HMAC key, same as a blank secret. HMAC zero-pads the
+        # key, so an all-NUL key signs exactly like b"" and is refused with it.
+        if not key.strip(b"\x00 \t\r\n\x0b\x0c"):
+            return False
     else:
         # Some providers document Svix-style headers but hand out raw shared secrets.
         logger.debug("[webhook] Validating Svix-style signature with raw secret")
@@ -197,7 +211,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._global_secret: str = extra.get("secret", "")
         self._static_routes: Dict[str, dict] = extra.get("routes", {})
         self._dynamic_routes: Dict[str, dict] = {}
-        self._dynamic_routes_mtime: float = 0.0
+        self._dynamic_routes_stat: Optional[tuple] = None
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
         self._v1_signature_warned: set[str] = set()  # routes already warned about legacy V1 (once per route)
@@ -225,8 +239,9 @@ class WebhookAdapter(BasePlatformAdapter):
     def _validate_route(self, name: str, route: dict) -> None:
         """Startup validation: secret required; INSECURE_NO_AUTH only on loopback (crash early on a public footgun)."""
         secret = route.get("secret", self._global_secret)
-        if not secret:
-            raise ValueError(f"[webhook] Route '{name}' has no HMAC secret. Set 'secret' on the route or globally. "
+        if not _is_usable_secret(secret):
+            raise ValueError(f"[webhook] Route '{name}' HMAC secret is missing, blank, or not a string. Set 'secret' "
+                             f"on the route or globally. "
                              f"For testing without auth, set secret to '{_INSECURE_NO_AUTH}'.")
         if secret == _INSECURE_NO_AUTH and not _is_loopback_host(self._host):
             raise ValueError(f"[webhook] Route '{name}' uses INSECURE_NO_AUTH secret but is bound to non-loopback "
@@ -375,12 +390,13 @@ class WebhookAdapter(BasePlatformAdapter):
         return web.json_response({"status": "ok", "platform": "webhook"})
 
     def _dynamic_route_allowed(self, name: str, route: dict) -> bool:
-        """An empty effective secret would make _handle_webhook skip HMAC validation → reject such
-        dynamic routes; INSECURE_NO_AUTH is loopback-only."""
+        """Reject dynamic routes whose effective secret is missing, blank, or not a string
+        (_is_usable_secret); INSECURE_NO_AUTH is loopback-only."""
         effective_secret = route.get("secret", self._global_secret)
-        if not effective_secret:
-            logger.warning("[webhook] Dynamic route '%s' skipped: 'secret' is missing or empty. Set a valid HMAC "
-                           "secret, or use '%s' to explicitly disable auth (testing only).", name, _INSECURE_NO_AUTH)
+        if not _is_usable_secret(effective_secret):
+            logger.warning("[webhook] Dynamic route '%s' skipped: 'secret' is missing, blank, or not a string. "
+                           "Set a valid HMAC secret, or use '%s' to explicitly disable auth (testing only).",
+                           name, _INSECURE_NO_AUTH)
             return False
         if effective_secret == _INSECURE_NO_AUTH and not _is_loopback_host(self._host):
             logger.warning("[webhook] Dynamic route '%s' skipped: INSECURE_NO_AUTH is only allowed on loopback "
@@ -395,25 +411,44 @@ class WebhookAdapter(BasePlatformAdapter):
         return True
 
     def _reload_dynamic_routes(self) -> None:
-        """Reload agent-created subscriptions from disk if the file changed."""
+        """Reload agent-created subscriptions when the file's stat identity changes.
+
+        Runs on every POST before auth, so it never takes the CLI writer lock: writers publish via
+        atomic rename, which also gives the file a new inode, so a restored mtime cannot hide a change.
+        """
         from hermes_constants import get_hermes_home
         subs_path = get_hermes_home() / _DYNAMIC_ROUTES_FILENAME
-        if not subs_path.exists():
+        try:
+            st = subs_path.stat()
+        except FileNotFoundError:
             if self._dynamic_routes:
                 self._dynamic_routes, self._routes = {}, dict(self._static_routes)
                 logger.debug("[webhook] Dynamic subscriptions file removed, cleared dynamic routes")
+            self._dynamic_routes_stat = None
+            return
+        stat_key = (st.st_mtime_ns, st.st_size, st.st_ino)
+        if stat_key == self._dynamic_routes_stat:
+            return  # No change
+        try:
+            data = json.loads(subs_path.read_text(encoding="utf-8-sig"))
+        except ValueError as e:
+            # Keep the last good snapshot, and remember this version so it is parsed once, not per POST.
+            self._dynamic_routes_stat = stat_key
+            logger.error("[webhook] Failed to parse dynamic routes: %s", e)
+            return
+        except OSError as e:
+            logger.error("[webhook] Failed to read dynamic routes: %s", e)
+            return
+        if not isinstance(data, dict):
+            self._dynamic_routes_stat = stat_key  # keep the last good snapshot; parse this version once
             return
         try:
-            mtime = subs_path.stat().st_mtime
-            if mtime <= self._dynamic_routes_mtime:
-                return  # No change
-            data = json.loads(subs_path.read_text(encoding="utf-8-sig"))
-            if not isinstance(data, dict):
-                return
             self._dynamic_routes = {  # static routes take precedence
-                k: v for k, v in data.items() if k not in self._static_routes and self._dynamic_route_allowed(k, v)}
+                k: v for k, v in data.items()
+                if isinstance(v, dict) and k not in self._static_routes and self._dynamic_route_allowed(k, v)
+            }
             self._routes = {**self._dynamic_routes, **self._static_routes}
-            self._dynamic_routes_mtime = mtime
+            self._dynamic_routes_stat = stat_key
             logger.info("[webhook] Reloaded %d dynamic route(s): %s", len(self._dynamic_routes),
                         ", ".join(self._dynamic_routes.keys()) or "(none)")
         except Exception as e:
@@ -481,11 +516,12 @@ class WebhookAdapter(BasePlatformAdapter):
             return None, _json_error("Bad request", 400)
         if len(raw_body) > self._max_body_bytes:  # defense in depth if the server-level limit was bypassed
             return None, _json_error("Payload too large", 413)
-        # Missing/empty secrets fail closed here too (not only in connect()), so direct handler reuse
-        # cannot become an unauthenticated dispatch surface.
+        # Missing, blank, or non-string secrets fail closed here too (not only in connect()), so direct
+        # handler reuse cannot become an unauthenticated dispatch surface.
         secret = route_config.get("secret", self._global_secret)
-        if not secret:
-            logger.error("[webhook] Route %s has no HMAC secret; refusing request", route_name)
+        if not _is_usable_secret(secret):
+            logger.error("[webhook] Route %s HMAC secret is missing, blank, or not a string; refusing request",
+                         route_name)
             return None, _json_error("Webhook route is missing an HMAC secret", 403)
         if secret != _INSECURE_NO_AUTH and not self._validate_signature(request, raw_body, secret):
             logger.warning("[webhook] Invalid signature for route %s", route_name)
@@ -562,7 +598,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
     def _resolve_route(self, request: "web.Request") -> "tuple[str, Optional[dict], Any, Optional[web.Response]]":
         """Route + profile lookup for a POST; ``(route_name, route_config, profile, error_response)``."""
-        self._reload_dynamic_routes()  # hot-reload dynamic subscriptions (mtime-gated, cheap)
+        self._reload_dynamic_routes()  # hot-reload dynamic subscriptions (stat-gated, lock-free)
         route_name = request.match_info.get("route_name", "")
         route_config = self._routes.get(route_name)
         profile = self._resolve_request_profile(request)
